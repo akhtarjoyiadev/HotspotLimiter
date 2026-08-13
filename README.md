@@ -4,7 +4,7 @@
 
 Unlike traditional network limiters that throttle the entire PC connection, HotspotLimiter operates at the network packet forwarding layer—capping only traffic routed between connected clients and the internet, leaving your host PC's traffic completely unthrottled.
 
-**Download the latest [True Single-File Executable](https://github.com/innfo/HotspotLimiter/releases) (No installation required!)**
+**Download the latest [True Single-File Executable](https://github.com/akhtarjoyiadev/HotspotLimiter/releases) (No installation required!)**
 
 ---
 
