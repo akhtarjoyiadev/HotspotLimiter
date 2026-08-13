@@ -35,6 +35,9 @@ internal static class Program
                 return;
             }
 
+            ExtractResource("HotspotLimiter.WinDivert.dll", "WinDivert.dll");
+            ExtractResource("HotspotLimiter.WinDivert64.sys", "WinDivert64.sys");
+
             ApplicationConfiguration.Initialize();
             bool startMinimized = args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase) || a.Equals("--minimized", StringComparison.OrdinalIgnoreCase));
 
@@ -48,12 +51,33 @@ internal static class Program
             Log.Write("Fatal in Main: " + ex);
         }
     }
+
+    private static void ExtractResource(string resourceName, string fileName)
+    {
+        try
+        {
+            var path = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, fileName);
+            if (!File.Exists(path))
+            {
+                using var stream = System.Reflection.Assembly.GetExecutingAssembly().GetManifestResourceStream(resourceName);
+                if (stream != null)
+                {
+                    using var file = File.Create(path);
+                    stream.CopyTo(file);
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.Write("Error extracting " + fileName + ": " + ex);
+        }
+    }
 }
 
 public sealed class MainForm : Form
 {
     readonly ComboBox adapter = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 310 };
-    readonly NumericUpDown limit = new() { Minimum = 0.5m, Maximum = 100000, Value = 5.0m, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
+    readonly NumericUpDown limit = new() { Minimum = 0.5m, Maximum = 100000, Value = 4.0m, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
     readonly Button start = new() { Text = "▶ Start limiter", Width = 110, Height = 28 };
     readonly Button stop = new() { Text = "⏹ Stop", Width = 80, Height = 28, Enabled = false };
     readonly Button toggleHotspot = new() { Text = "📶 Toggle Hotspot", Width = 130, Height = 28 };
@@ -90,7 +114,7 @@ public sealed class MainForm : Form
     public MainForm(bool startMinimized)
     {
         this.startedMinimized = startMinimized;
-        Text = "Hotspot Limiter & Wi-Fi Tracker (5.0 Mbps)";
+        Text = "Hotspot Limiter & Wi-Fi Tracker (4.0 Mbps)";
         Width = 750; Height = 560;
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(650, 420);
@@ -296,7 +320,7 @@ public sealed class MainForm : Form
             trayIcon.Icon = SystemIcons.Application;
         }
 
-        trayIcon.Text = "Hotspot Limiter - 5.0 Mbps Cap";
+        trayIcon.Text = "Hotspot Limiter - 4.0 Mbps Cap";
         trayIcon.Visible = true;
         trayIcon.DoubleClick += (_, _) => RestoreFromTray();
 

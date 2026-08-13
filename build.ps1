@@ -8,7 +8,8 @@ if (Test-Path $outputDir) {
     Remove-Item -Recurse -Force $outputDir
 }
 
-dotnet publish (Join-Path $PSScriptRoot "HotspotLimiter.csproj") `
+$env:DOTNET_ROOT = "C:\Users\innfo\.dotnet"
+C:\Users\innfo\.dotnet\dotnet.exe publish (Join-Path $PSScriptRoot "HotspotLimiter.csproj") `
     -c Release `
     -r win-x64 `
     --self-contained true `

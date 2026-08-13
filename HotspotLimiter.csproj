@@ -6,5 +6,11 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <Platforms>x64</Platforms>
+    <ApplicationIcon>icon.ico</ApplicationIcon>
   </PropertyGroup>
+
+  <ItemGroup>
+    <EmbeddedResource Include="WinDivert.dll" />
+    <EmbeddedResource Include="WinDivert64.sys" />
+  </ItemGroup>
 </Project>

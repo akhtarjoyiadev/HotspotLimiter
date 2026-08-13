@@ -1,8 +1,10 @@
-# HotspotLimiter 🚀
+# HotspotLimiter 🚀 | Free Windows Mobile Hotspot Bandwidth Limiter
 
-**HotspotLimiter** is a lightweight Windows utility designed to monitor, shape, and throttle bandwidth across all devices connected to a **Windows Mobile Hotspot** (Internet Connection Sharing / Wi-Fi Direct).
+**HotspotLimiter** is a lightweight, open-source Windows utility designed to monitor, shape, and throttle bandwidth across all devices connected to a **Windows Mobile Hotspot** (Internet Connection Sharing / Wi-Fi Direct). If you are looking for a free NetLimiter alternative or a Wi-Fi tethering speed capper for Windows 10 and Windows 11, this is the perfect tool.
 
 Unlike traditional network limiters that throttle the entire PC connection, HotspotLimiter operates at the network packet forwarding layer—capping only traffic routed between connected clients and the internet, leaving your host PC's traffic completely unthrottled.
+
+**Download the latest [True Single-File Executable](https://github.com/innfo/HotspotLimiter/releases) (No installation required!)**
 
 ---
 
@@ -41,15 +43,14 @@ Unlike traditional network limiters that throttle the entire PC connection, Hots
 - [.NET 8.0 SDK](https://dotnet.microsoft.com/download/dotnet/8.0)
 
 ### 1. Build Standalone Single-File Release (No .NET installation required on target PC)
+The project is configured to embed `WinDivert.dll` and `WinDivert64.sys` automatically as embedded resources. They will be extracted at runtime, so you only need to distribute the single `HotspotLimiter.exe` file.
+
 ```powershell
 dotnet publish HotspotLimiter.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -p:EnableCompressionInSingleFile=true -o "./publish"
 ```
 
-### 2. Copy WinDivert Native Files
-Place `WinDivert.dll` and `WinDivert64.sys` into the `./publish` directory beside `HotspotLimiter.exe`.
-
-### 3. Run
-Right-click `HotspotLimiter.exe` and select **Run as Administrator**.
+### 2. Run
+Right-click the generated `HotspotLimiter.exe` and select **Run as Administrator**.
 
 ---
 
