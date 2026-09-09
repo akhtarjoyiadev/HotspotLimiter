@@ -11,6 +11,7 @@ Unlike traditional network limiters that throttle the entire PC connection, Hots
 ## ✨ Features
 
 - **🌐 Aggregate Hotspot Bandwidth Cap**: Configurable aggregate bandwidth limit (upload + download) enforced using a precise token-bucket algorithm.
+- **📅 Per-Device Daily Quotas**: Optional persistent daily data limit for each hotspot device; packets are dropped after the device reaches its quota.
 - **⚡ Host PC Unaffected**: Uses WinDivert's `NETWORK_FORWARD` layer so local PC downloads/uploads remain at full network speed.
 - **📱 Live Device & Traffic Tracker**:
   - Auto-discovers connected hotspot client devices (`192.168.137.x` subnet).
@@ -20,6 +21,7 @@ Unlike traditional network limiters that throttle the entire PC connection, Hots
 - **📶 Auto-Detect & Hotspot Control**:
   - Automatically manages Windows Mobile Hotspot state via Windows Runtime (`NetworkOperatorTetheringManager`) APIs.
   - Option to auto-start Mobile Hotspot if turned off.
+  - Limiter auto-start is optional and disabled by default, so bandwidth and quota settings can be selected before starting.
 - **🔔 System Tray Integration**: Minimizes to system tray on close with background monitoring.
 - **🚀 Windows Auto-Start**: Supports elevated startup with Windows login via Task Scheduler with a 10-second boot delay for network adapter readiness.
 
@@ -62,6 +64,7 @@ Right-click the generated `HotspotLimiter.exe` and select **Run as Administrator
    ```
 2. **Token Bucket Rate Limiting**: Buffers and releases packets matching the specified token rate (e.g. 5.0 Mbps cap) with a small burst reserve (0.25s) for smooth streaming and browsing latency.
 3. **Per-Device Accounting**: Inspects IPv4 headers to categorize client traffic into download vs. upload and calculates instantaneous data rates.
+4. **Daily Quota Enforcement**: Stores the current day's per-device byte totals in `%LOCALAPPDATA%\HotspotLimiter\daily-usage.json` and blocks new forwarded packets after the configured device quota is reached. Settings are stored in `%LOCALAPPDATA%\HotspotLimiter\settings.json`.
 
 ---
 

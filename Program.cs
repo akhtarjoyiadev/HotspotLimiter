@@ -7,6 +7,7 @@ using System.Net.NetworkInformation;
 using System.Net.Sockets;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Text.Json;
 using System.Threading;
 using System.Windows.Forms;
 
@@ -78,6 +79,7 @@ public sealed class MainForm : Form
 {
     readonly ComboBox adapter = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 310 };
     readonly NumericUpDown limit = new() { Minimum = 0.5m, Maximum = 100000, Value = 4.0m, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
+    readonly NumericUpDown dailyLimit = new() { Minimum = 0.0m, Maximum = 1000.0m, Value = 1.0m, DecimalPlaces = 2, Increment = 0.25m, Width = 80 };
     readonly Button start = new() { Text = "▶ Start limiter", Width = 110, Height = 28 };
     readonly Button stop = new() { Text = "⏹ Stop", Width = 80, Height = 28, Enabled = false };
     readonly Button toggleHotspot = new() { Text = "📶 Toggle Hotspot", Width = 130, Height = 28 };
@@ -88,6 +90,7 @@ public sealed class MainForm : Form
     readonly Label hotspotStatusLabel = new() { AutoSize = true, Text = "Hotspot: Checking...", Font = new Font("Segoe UI", 9f) };
 
     readonly CheckBox autoStartHotspot = new() { Text = "Auto-start Mobile Hotspot if Off", AutoSize = true, Checked = true };
+    readonly CheckBox autoStartLimiter = new() { Text = "Auto-start limiter", AutoSize = true, Checked = false };
     readonly CheckBox startup = new() { Text = "Start with Windows (10s delay, silent)", AutoSize = true };
     readonly CheckBox minimizeToTray = new() { Text = "Minimize to tray on [X]", AutoSize = true, Checked = true };
 
@@ -109,11 +112,18 @@ public sealed class MainForm : Form
     System.Windows.Forms.Timer? statsTimer;
     System.Windows.Forms.Timer? autoDetectTimer;
     bool isExiting = false;
+    bool limiterManuallyStopped = false;
+    bool hotspotWasOn = false;
+    bool autoDetectRunning = false;
     readonly bool startedMinimized;
 
     public MainForm(bool startMinimized)
     {
         this.startedMinimized = startMinimized;
+        var savedSettings = SettingsStore.Load();
+        limit.Value = ClampDecimal(savedSettings.LimitMbps, limit.Minimum, limit.Maximum);
+        dailyLimit.Value = ClampDecimal(savedSettings.DailyLimitGb, dailyLimit.Minimum, dailyLimit.Maximum);
+        autoStartLimiter.Checked = savedSettings.AutoStartLimiter;
         Text = "Hotspot Limiter & Wi-Fi Tracker (4.0 Mbps)";
         Width = 750; Height = 560;
         StartPosition = FormStartPosition.CenterScreen;
@@ -124,11 +134,11 @@ public sealed class MainForm : Form
 
         // Layout
         var mainContainer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
-        mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 135));
+        mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
         mainContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
 
-        var topPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 4 };
+        var topPanel = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 4, RowCount = 5 };
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 120));
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Percent, 60));
         topPanel.ColumnStyles.Add(new ColumnStyle(SizeType.Absolute, 110));
@@ -138,6 +148,9 @@ public sealed class MainForm : Form
         topPanel.Controls.Add(adapter, 1, 0);
         topPanel.Controls.Add(new Label { Text = "Total Cap (Mbps):", AutoSize = true, Anchor = AnchorStyles.Left }, 2, 0);
         topPanel.Controls.Add(limit, 3, 0);
+
+        topPanel.Controls.Add(new Label { Text = "Daily Limit / Device (GB):", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4);
+        topPanel.Controls.Add(dailyLimit, 1, 4);
 
         var buttonFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
         buttonFlow.Controls.Add(start);
@@ -149,6 +162,7 @@ public sealed class MainForm : Form
 
         var checkFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.LeftToRight };
         checkFlow.Controls.Add(autoStartHotspot);
+        checkFlow.Controls.Add(autoStartLimiter);
         checkFlow.Controls.Add(startup);
         checkFlow.Controls.Add(minimizeToTray);
         topPanel.SetColumnSpan(checkFlow, 4);
@@ -182,6 +196,9 @@ public sealed class MainForm : Form
         resetStats.Click += (_, _) => ResetAllStats();
         startup.CheckedChanged += (_, _) => StartupManager.SetEnabled(startup.Checked);
         startup.Checked = StartupManager.IsEnabled();
+        limit.ValueChanged += (_, _) => SaveSettings();
+        dailyLimit.ValueChanged += (_, _) => SaveSettings();
+        autoStartLimiter.CheckedChanged += (_, _) => SaveSettings();
 
         statsTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         statsTimer.Tick += (_, _) => UpdateStats();
@@ -191,6 +208,8 @@ public sealed class MainForm : Form
         autoDetectTimer = new System.Windows.Forms.Timer { Interval = 3000 };
         autoDetectTimer.Tick += async (_, _) =>
         {
+            if (autoDetectRunning) return;
+            autoDetectRunning = true;
             try
             {
                 bool isHotspotOn = await HotspotController.IsHotspotOnAsync();
@@ -207,6 +226,13 @@ public sealed class MainForm : Form
 
                 if (isHotspotOn)
                 {
+                    if (!hotspotWasOn)
+                    {
+                        // A newly started hotspot is a new opportunity for automatic startup.
+                        limiterManuallyStopped = false;
+                    }
+                    hotspotWasOn = true;
+
                     var virtualAdapter = FindHotspotAdapter();
                     if (virtualAdapter is not null)
                     {
@@ -214,27 +240,55 @@ public sealed class MainForm : Form
                         uint vIdx = GetInterfaceIndex(virtualAdapter);
                         uint? uIdx = uplink is not null ? GetInterfaceIndex(uplink) : null;
 
-                        if (limiter is null || activeVirtualIdx != vIdx || activeUplinkIdx != uIdx)
+                        bool adapterChanged = limiter is not null &&
+                            (activeVirtualIdx != vIdx || activeUplinkIdx != uIdx);
+                        bool shouldStartAutomatically = limiter is null && autoStartLimiter.Checked;
+                        if (!limiterManuallyStopped && (shouldStartAutomatically || adapterChanged))
                         {
                             Log.Write($"Hotspot detected: virtual={virtualAdapter.Name} (ifIdx {vIdx}), uplink={(uplink?.Name ?? "none")} (ifIdx {uIdx?.ToString() ?? "-"}) - (re)binding limiter.");
                             LoadAdapters();
                             StartLimiter(virtualAdapter, uplink);
                         }
+                        else if (limiter is null)
+                        {
+                            status.Text = limiterManuallyStopped
+                                ? "Stopped (manual)"
+                                : "Hotspot ready - click Start limiter";
+                            status.ForeColor = Color.DarkOrange;
+                        }
                     }
                     else
                     {
                         Log.Write("Hotspot reported On but no hotspot virtual adapter found; waiting.");
+                        status.Text = "Waiting for hotspot adapter...";
+                        status.ForeColor = Color.DarkOrange;
                     }
                 }
-                else if (limiter is not null)
+                else
                 {
-                    Log.Write("Hotspot turned off; stopping limiter.");
-                    StopLimiter();
+                    hotspotWasOn = false;
+                    limiterManuallyStopped = false;
+                    if (limiter is not null)
+                    {
+                        Log.Write("Hotspot turned off; stopping limiter.");
+                        StopLimiter(false);
+                    }
+                    else
+                    {
+                        status.Text = autoStartHotspot.Checked
+                            ? "Waiting for Wi-Fi Hotspot..."
+                            : "Hotspot is off";
+                        status.ForeColor = Color.DarkOrange;
+                    }
                 }
             }
             catch (Exception ex)
             {
                 Log.Write("Auto-detect error: " + ex);
+            }
+            finally
+            {
+                autoDetectRunning = false;
             }
         };
         autoDetectTimer.Start();
@@ -266,9 +320,14 @@ public sealed class MainForm : Form
                 {
                     LoadAdapters();
                     var virtualAdapter = FindHotspotAdapter();
-                    if (virtualAdapter is not null)
+                    if (virtualAdapter is not null && autoStartLimiter.Checked)
                     {
                         StartLimiter(virtualAdapter, FindUplinkAdapter(virtualAdapter));
+                    }
+                    else if (virtualAdapter is not null)
+                    {
+                        status.Text = "Hotspot ready - select limits, then click Start limiter";
+                        status.ForeColor = Color.DarkOrange;
                     }
                     else
                     {
@@ -294,6 +353,28 @@ public sealed class MainForm : Form
         base.SetVisibleCore(value);
     }
 
+    static decimal ClampDecimal(double value, decimal minimum, decimal maximum)
+    {
+        decimal result = (decimal)value;
+        return Math.Min(maximum, Math.Max(minimum, result));
+    }
+
+    void SaveSettings()
+    {
+        SettingsStore.Save(new AppSettings
+        {
+            LimitMbps = (double)limit.Value,
+            DailyLimitGb = (double)dailyLimit.Value,
+            AutoStartLimiter = autoStartLimiter.Checked
+        });
+    }
+
+    static long ToDailyLimitBytes(decimal gigabytes)
+    {
+        if (gigabytes <= 0) return 0;
+        return checked((long)(gigabytes * 1_000_000_000m));
+    }
+
     void InitDeviceList()
     {
         deviceList.Columns.Add("Device IP", 120);
@@ -302,6 +383,8 @@ public sealed class MainForm : Form
         deviceList.Columns.Add("Download", 85);
         deviceList.Columns.Add("Upload", 85);
         deviceList.Columns.Add("Total Usage", 90);
+        deviceList.Columns.Add("Today", 85);
+        deviceList.Columns.Add("Quota", 95);
         deviceList.Columns.Add("Current Speed", 95);
         deviceList.Columns.Add("Last Active", 80);
 
@@ -368,6 +451,9 @@ public sealed class MainForm : Form
         if (isOn)
         {
             await HotspotController.StopHotspotAsync();
+            hotspotWasOn = false;
+            limiterManuallyStopped = false;
+            StopLimiter(false);
             hotspotStatusLabel.Text = "Hotspot: Off";
             hotspotStatusLabel.ForeColor = Color.DarkOrange;
         }
@@ -376,9 +462,14 @@ public sealed class MainForm : Form
             await HotspotController.StartHotspotAsync();
             hotspotStatusLabel.Text = "Hotspot: On (Wi-Fi)";
             hotspotStatusLabel.ForeColor = Color.DarkGreen;
+            hotspotWasOn = true;
+            limiterManuallyStopped = false;
         }
         LoadAdapters();
-        StartLimiter();
+        if (!isOn && autoStartLimiter.Checked)
+        {
+            StartLimiter();
+        }
         toggleHotspot.Enabled = true;
     }
 
@@ -398,10 +489,11 @@ public sealed class MainForm : Form
 
     static NetworkInterface? FindUplinkAdapter(NetworkInterface? hotspot)
     {
+        string? hotspotId = hotspot?.Id;
         var candidates = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up &&
                         n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                        n != hotspot)
+                        n.Id != hotspotId)
             .ToList();
 
         var withGateway = candidates.FirstOrDefault(n => n.GetIPProperties().GatewayAddresses.Count > 0);
@@ -472,6 +564,7 @@ public sealed class MainForm : Form
 
     void StartLimiter()
     {
+        limiterManuallyStopped = false;
         var virtualAdapter = FindHotspotAdapter();
         if (virtualAdapter is null)
         {
@@ -487,7 +580,7 @@ public sealed class MainForm : Form
     {
         try
         {
-            StopLimiter();
+            StopLimiter(false);
 
             uint vIdx = GetInterfaceIndex(virtualAdapter);
             uint? uIdx = uplink is not null ? GetInterfaceIndex(uplink) : null;
@@ -498,11 +591,13 @@ public sealed class MainForm : Form
 
             activeVirtualIdx = vIdx;
             activeUplinkIdx = uIdx;
-            limiter = new Limiter(filter, (double)limit.Value);
+            long dailyLimitBytes = ToDailyLimitBytes(dailyLimit.Value);
+            limiter = new Limiter(filter, (double)limit.Value, dailyLimitBytes);
             limiter.Start();
 
             string targetName = uplink is not null ? $"{virtualAdapter.Name} + {uplink.Name}" : virtualAdapter.Name;
-            status.Text = $"Active on {targetName} ({limit.Value:0.0} Mbps cap)";
+            string quotaText = dailyLimitBytes > 0 ? $"{FormatBytes(dailyLimitBytes)} / device / day" : "daily quota off";
+            status.Text = $"Active on {targetName} ({limit.Value:0.0} Mbps cap, {quotaText})";
             status.ForeColor = Color.DarkGreen;
             trayIcon.Text = $"Hotspot Limiter ({limit.Value:0.0} Mbps)";
             Log.Write($"Limiter started. Filter: {filter}");
@@ -511,6 +606,7 @@ public sealed class MainForm : Form
             stop.Enabled = true;
             adapter.Enabled = false;
             limit.Enabled = false;
+            dailyLimit.Enabled = false;
         }
         catch (Exception ex)
         {
@@ -524,8 +620,12 @@ public sealed class MainForm : Form
         }
     }
 
-    void StopLimiter()
+    void StopLimiter(bool userInitiated = true)
     {
+        if (userInitiated)
+        {
+            limiterManuallyStopped = true;
+        }
         limiter?.Dispose();
         limiter = null;
         activeVirtualIdx = 0;
@@ -537,6 +637,7 @@ public sealed class MainForm : Form
         stop.Enabled = false;
         adapter.Enabled = true;
         limit.Enabled = true;
+        dailyLimit.Enabled = true;
     }
 
     void ResetAllStats()
@@ -552,7 +653,8 @@ public sealed class MainForm : Form
 
         var devices = limiter.GetDevicesSnapshot();
         long totalBytes = limiter.TotalBytes;
-        usage.Text = $"Total Forwarded: {FormatBytes(totalBytes)} | Active Devices: {devices.Count}";
+        string quotaText = limiter.DailyLimitBytes > 0 ? $" | Daily/device: {FormatBytes(limiter.DailyLimitBytes)}" : "";
+        usage.Text = $"Total Forwarded: {FormatBytes(totalBytes)} | Active Devices: {devices.Count}{quotaText}";
 
         deviceList.BeginUpdate();
         try
@@ -577,8 +679,11 @@ public sealed class MainForm : Form
                     item.SubItems[3].Text = FormatBytes(d.DownloadBytes);
                     item.SubItems[4].Text = FormatBytes(d.UploadBytes);
                     item.SubItems[5].Text = FormatBytes(d.TotalBytes);
-                    item.SubItems[6].Text = speedText;
-                    item.SubItems[7].Text = activeText;
+                    item.SubItems[6].Text = FormatBytes(d.TodayBytes);
+                    item.SubItems[7].Text = d.QuotaReached ? "LIMIT REACHED" :
+                        (limiter.DailyLimitBytes > 0 ? FormatBytes(limiter.DailyLimitBytes - Math.Min(d.TodayBytes, limiter.DailyLimitBytes)) + " left" : "Off");
+                    item.SubItems[8].Text = speedText;
+                    item.SubItems[9].Text = activeText;
                 }
                 else
                 {
@@ -588,6 +693,9 @@ public sealed class MainForm : Form
                     newItem.SubItems.Add(FormatBytes(d.DownloadBytes));
                     newItem.SubItems.Add(FormatBytes(d.UploadBytes));
                     newItem.SubItems.Add(FormatBytes(d.TotalBytes));
+                    newItem.SubItems.Add(FormatBytes(d.TodayBytes));
+                    newItem.SubItems.Add(d.QuotaReached ? "LIMIT REACHED" :
+                        (limiter.DailyLimitBytes > 0 ? FormatBytes(limiter.DailyLimitBytes - Math.Min(d.TodayBytes, limiter.DailyLimitBytes)) + " left" : "Off"));
                     newItem.SubItems.Add(speedText);
                     newItem.SubItems.Add(activeText);
                     deviceList.Items.Add(newItem);
@@ -643,6 +751,7 @@ public sealed class MainForm : Form
         }
 
         limiter?.Dispose();
+        DailyUsageStore.Flush();
         trayIcon.Visible = false;
         trayIcon.Dispose();
         Log.Write("HotspotLimiter exiting.");
@@ -660,6 +769,9 @@ public sealed class MainForm : Form
 public sealed class DeviceStats
 {
     public string IpAddress { get; set; } = "";
+    // Windows Mobile Hotspot assigns addresses from this subnet. The IP is used
+    // as the quota key because it is available before ARP/DNS resolution finishes.
+    public string QuotaKey { get; set; } = "";
     public string MacAddress { get; set; } = "Resolving...";
     public string HostName { get; set; } = "Device";
     public long DownloadBytes;
@@ -670,6 +782,8 @@ public sealed class DeviceStats
     public double CurrentSpeedBps;
     public DateTime LastSeen = DateTime.UtcNow;
     public DateTime FirstSeen = DateTime.UtcNow;
+    public bool QuotaReached;
+    public long TodayBytes => DailyUsageStore.Get(QuotaKey.Length > 0 ? QuotaKey : IpAddress);
 }
 
 public sealed class Limiter : IDisposable
@@ -679,6 +793,7 @@ public sealed class Limiter : IDisposable
     readonly string filter;
     readonly double bytesPerSecond;
     readonly double maxTokens;
+    readonly long dailyLimitBytes;
     IntPtr handle = IntPtr.Zero;
     CancellationTokenSource cts = new();
     long totalBytes;
@@ -690,12 +805,14 @@ public sealed class Limiter : IDisposable
     System.Threading.Timer? speedCalcTimer;
 
     public long TotalBytes => Interlocked.Read(ref totalBytes);
+    public long DailyLimitBytes => dailyLimitBytes;
 
-    public Limiter(string filter, double mbps)
+    public Limiter(string filter, double mbps, long dailyLimitBytes)
     {
         this.filter = filter;
         bytesPerSecond = mbps * 1_000_000.0 / 8.0;
         maxTokens = Math.Max(bytesPerSecond * BurstSeconds, 8192);
+        this.dailyLimitBytes = dailyLimitBytes;
         tokens = maxTokens;
         lastTicks = Stopwatch.GetTimestamp();
 
@@ -748,22 +865,45 @@ public sealed class Limiter : IDisposable
             }
             if (len == 0) continue;
 
-            TrackPacket(packet, (int)len);
+            if (!TryReservePacket(packet, (int)len, out var device, out bool isDownload))
+            {
+                // Dropping the packet makes the client stop receiving data once
+                // its daily quota is reached. TCP/QUIC will retry, but retries
+                // are not counted as additional usage.
+                continue;
+            }
 
             await Consume((int)len).ConfigureAwait(false);
             uint sent = 0;
-            WinDivert.Send(handle, packet, len, ref sent, ref addr);
+            if (!WinDivert.Send(handle, packet, len, ref sent, ref addr))
+            {
+                continue;
+            }
             Interlocked.Add(ref totalBytes, len);
+            if (device is not null)
+            {
+                device.LastSeen = DateTime.UtcNow;
+                Interlocked.Add(ref device.PeriodBytes, (long)len);
+                if (isDownload)
+                {
+                    Interlocked.Add(ref device.DownloadBytes, (long)len);
+                }
+                else
+                {
+                    Interlocked.Add(ref device.UploadBytes, (long)len);
+                }
+            }
         }
     }
 
-    void TrackPacket(byte[] packet, int len)
+    bool TryReservePacket(byte[] packet, int len, out DeviceStats? device, out bool isDownload)
     {
-        if (len < 20) return;
+        device = null;
+        isDownload = false;
+        if (len < 20) return true;
         int version = packet[0] >> 4;
 
         string? clientIp = null;
-        bool isDownload = false;
 
         if (version == 4)
         {
@@ -782,26 +922,28 @@ public sealed class Limiter : IDisposable
             }
         }
 
-        if (clientIp is not null)
-        {
-            var stats = devices.GetOrAdd(clientIp, ip =>
-            {
-                var newDevice = new DeviceStats { IpAddress = ip };
-                Task.Run(() => ResolveDeviceInfo(newDevice));
-                return newDevice;
-            });
+        if (clientIp is null) return true;
 
-            stats.LastSeen = DateTime.UtcNow;
-            Interlocked.Add(ref stats.PeriodBytes, len);
-            if (isDownload)
-            {
-                Interlocked.Add(ref stats.DownloadBytes, len);
-            }
-            else
-            {
-                Interlocked.Add(ref stats.UploadBytes, len);
-            }
+        device = devices.GetOrAdd(clientIp, ip =>
+        {
+            var newDevice = new DeviceStats { IpAddress = ip, QuotaKey = ip };
+            Task.Run(() => ResolveDeviceInfo(newDevice));
+            return newDevice;
+        });
+
+        if (dailyLimitBytes > 0 && !DailyUsageStore.TryReserve(device.QuotaKey, len, dailyLimitBytes))
+        {
+            device.QuotaReached = true;
+            device.LastSeen = DateTime.UtcNow;
+            return false;
         }
+
+        if (dailyLimitBytes <= 0)
+        {
+            DailyUsageStore.Add(device.QuotaKey, len);
+        }
+
+        return true;
     }
 
     bool IsClientIp(string ip) => ip.StartsWith("192.168.137.") && !ip.EndsWith(".1") && !ip.EndsWith(".255");
@@ -889,6 +1031,7 @@ public sealed class Limiter : IDisposable
             handle = IntPtr.Zero;
         }
         cts.Dispose();
+        DailyUsageStore.Flush();
     }
 }
 
@@ -1087,6 +1230,179 @@ public static class StartupManager
             }
         }
         catch { }
+    }
+}
+
+public sealed class AppSettings
+{
+    public double LimitMbps { get; set; } = 4.0;
+    public double DailyLimitGb { get; set; } = 1.0;
+    public bool AutoStartLimiter { get; set; } = false;
+}
+
+static class SettingsStore
+{
+    static readonly string FilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "HotspotLimiter", "settings.json");
+
+    public static AppSettings Load()
+    {
+        try
+        {
+            if (File.Exists(FilePath))
+            {
+                return JsonSerializer.Deserialize<AppSettings>(File.ReadAllText(FilePath)) ?? new AppSettings();
+            }
+        }
+        catch
+        {
+            // Fall back to safe defaults if the settings file is incomplete/corrupt.
+        }
+        return new AppSettings();
+    }
+
+    public static void Save(AppSettings settings)
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+            File.WriteAllText(FilePath, JsonSerializer.Serialize(settings, new JsonSerializerOptions { WriteIndented = true }));
+        }
+        catch
+        {
+            // Settings are optional; limiter operation must continue if saving fails.
+        }
+    }
+}
+
+static class DailyUsageStore
+{
+    sealed class UsageFile
+    {
+        public string Date { get; set; } = DateTime.Now.ToString("yyyy-MM-dd");
+        public Dictionary<string, long> DeviceBytes { get; set; } = new(StringComparer.OrdinalIgnoreCase);
+    }
+
+    static readonly object Gate = new();
+    static readonly string FilePath = Path.Combine(
+        Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+        "HotspotLimiter", "daily-usage.json");
+    static string date = DateTime.Now.ToString("yyyy-MM-dd");
+    static Dictionary<string, long> deviceBytes = new(StringComparer.OrdinalIgnoreCase);
+    static DateTime lastSaveUtc = DateTime.MinValue;
+    static long unsavedBytes;
+
+    static DailyUsageStore()
+    {
+        Load();
+    }
+
+    public static long Get(string key)
+    {
+        if (string.IsNullOrWhiteSpace(key)) return 0;
+        lock (Gate)
+        {
+            EnsureCurrentDayLocked();
+            return deviceBytes.TryGetValue(key, out long value) ? value : 0;
+        }
+    }
+
+    public static bool TryReserve(string key, long bytes, long limitBytes)
+    {
+        if (string.IsNullOrWhiteSpace(key) || bytes <= 0) return true;
+        lock (Gate)
+        {
+            EnsureCurrentDayLocked();
+            long current = deviceBytes.TryGetValue(key, out long value) ? value : 0;
+            if (limitBytes > 0 && (current > limitBytes || bytes > limitBytes - current))
+            {
+                return false;
+            }
+
+            deviceBytes[key] = checked(current + bytes);
+            unsavedBytes = checked(unsavedBytes + bytes);
+            MaybeSaveLocked();
+            return true;
+        }
+    }
+
+    public static void Add(string key, long bytes)
+    {
+        if (string.IsNullOrWhiteSpace(key) || bytes <= 0) return;
+        lock (Gate)
+        {
+            EnsureCurrentDayLocked();
+            long current = deviceBytes.TryGetValue(key, out long value) ? value : 0;
+            deviceBytes[key] = checked(current + bytes);
+            unsavedBytes = checked(unsavedBytes + bytes);
+            MaybeSaveLocked();
+        }
+    }
+
+    public static void Flush()
+    {
+        lock (Gate)
+        {
+            EnsureCurrentDayLocked();
+            SaveLocked();
+        }
+    }
+
+    static void Load()
+    {
+        lock (Gate)
+        {
+            try
+            {
+                if (!File.Exists(FilePath)) return;
+                var stored = JsonSerializer.Deserialize<UsageFile>(File.ReadAllText(FilePath));
+                if (stored is not null && stored.Date == date && stored.DeviceBytes is not null)
+                {
+                    deviceBytes = new Dictionary<string, long>(stored.DeviceBytes, StringComparer.OrdinalIgnoreCase);
+                }
+            }
+            catch
+            {
+                deviceBytes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+            }
+        }
+    }
+
+    static void EnsureCurrentDayLocked()
+    {
+        string today = DateTime.Now.ToString("yyyy-MM-dd");
+        if (today == date) return;
+        date = today;
+        deviceBytes = new Dictionary<string, long>(StringComparer.OrdinalIgnoreCase);
+        unsavedBytes = 0;
+        SaveLocked();
+    }
+
+    static void MaybeSaveLocked()
+    {
+        if (unsavedBytes >= 1_000_000 || DateTime.UtcNow - lastSaveUtc >= TimeSpan.FromSeconds(15))
+        {
+            SaveLocked();
+        }
+    }
+
+    static void SaveLocked()
+    {
+        try
+        {
+            Directory.CreateDirectory(Path.GetDirectoryName(FilePath)!);
+            string tempPath = FilePath + ".tmp";
+            var stored = new UsageFile { Date = date, DeviceBytes = new Dictionary<string, long>(deviceBytes) };
+            File.WriteAllText(tempPath, JsonSerializer.Serialize(stored, new JsonSerializerOptions { WriteIndented = true }));
+            File.Move(tempPath, FilePath, true);
+            lastSaveUtc = DateTime.UtcNow;
+            unsavedBytes = 0;
+        }
+        catch
+        {
+            // The in-memory quota remains active even if persistence is unavailable.
+        }
     }
 }
 
