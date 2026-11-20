@@ -14,7 +14,8 @@ Unlike traditional network limiters that throttle the entire PC connection, Hots
 - **📅 Per-Device Daily Quotas**: Optional persistent daily data limit for each hotspot device; packets are dropped after the device reaches its quota.
 - **⚡ Host PC Unaffected**: Uses WinDivert's `NETWORK_FORWARD` layer so local PC downloads/uploads remain at full network speed.
 - **📱 Live Device & Traffic Tracker**:
-  - Auto-discovers connected hotspot client devices (`192.168.137.x` subnet).
+  - Enumerates associated hotspot clients through Windows, including clients that have not sent internet traffic.
+  - Classifies forwarded IPv4 traffic using the actual hotspot adapter address and subnet mask.
   - Resolves client MAC addresses via ARP (`SendARP`).
   - Resolves device hostnames via DNS (`GetHostEntry`).
   - Live per-device download/upload stats and real-time bandwidth consumption.
@@ -31,7 +32,7 @@ Unlike traditional network limiters that throttle the entire PC connection, Hots
 
 - **Operating System**: 64-bit Windows 10 or Windows 11 (x64).
 - **Permissions**: **Must be run as Administrator** (required for WinDivert kernel-mode packet filtering).
-- **Wi-Fi Hardware**: Wi-Fi adapter supporting Hosted Network / Wi-Fi Direct (Windows Mobile Hotspot capability).
+- **Wi-Fi Hardware**: Wi-Fi adapter and driver supporting Windows Mobile Hotspot / Wi-Fi Direct. Legacy `Hosted network supported` alone does not establish Mobile Hotspot compatibility.
 - **WinDivert Native Files**:
   - `WinDivert.dll` (x64)
   - `WinDivert64.sys` (x64 signed kernel driver)
@@ -60,11 +61,47 @@ Right-click the generated `HotspotLimiter.exe` and select **Run as Administrator
 
 1. **Packet Capture**: Intercepts forwarded packets using WinDivert's `NETWORK_FORWARD` layer:
    ```csharp
-   handle = WinDivert.Open("ifIdx == <virtualAdapterIdx> || ifIdx == <uplinkIdx>", WinDivertLayer.NetworkForward, 0, 0);
+   handle = WinDivert.Open(subnet.CaptureFilter, WinDivertLayer.NetworkForward, 0, 0);
    ```
-2. **Token Bucket Rate Limiting**: Buffers and releases packets matching the specified token rate (e.g. 5.0 Mbps cap) with a small burst reserve (0.25s) for smooth streaming and browsing latency.
+2. **Token Bucket Rate Limiting**: Releases packets at the configured aggregate upload + download rate. The burst capacity is at least one full 65,535-byte IP packet, preventing permanent stalls at low caps. Only the hotspot IPv4 subnet is intercepted; unrelated forwarding is left alone. IPv6 is currently not shaped or quota-accounted.
 3. **Per-Device Accounting**: Inspects IPv4 headers to categorize client traffic into download vs. upload and calculates instantaneous data rates.
 4. **Daily Quota Enforcement**: Stores the current day's per-device byte totals in `%LOCALAPPDATA%\HotspotLimiter\daily-usage.json` and blocks new forwarded packets after the configured device quota is reached. Settings are stored in `%LOCALAPPDATA%\HotspotLimiter\settings.json`.
+
+---
+
+## Reliability update (November 2026)
+
+- One serialized hotspot controller; no competing startup task and timer operations.
+- Actual Windows tethering state, client count, and useful operation errors instead of treating a leftover private IP as proof the access point is on.
+- 2.4 GHz compatibility configuration is awaited before starting the access point; startup retries use backoff.
+- Manual hotspot Stop is respected, even with auto-start checked.
+- No automatic `hosts.ics` rewriting or ICS service restarts at app startup.
+- Explicit **Repair hotspot** retains the SSID/password, briefly restarts the AP, and keeps the limiter off for connectivity testing.
+- Packet worker faults are surfaced and the diversion handle is closed safely rather than silently leaving traffic blocked.
+- Quota persistence is periodic instead of writing JSON every megabyte on the packet path. Quotas remain keyed by IPv4 address, not a tamper-proof device identity; DHCP reassignment or MAC randomization can affect attribution.
+- New installations default to no daily quota (`0` = off). Existing saved settings are preserved.
+- Elevated application manifest, a single Task Scheduler startup entry, log rotation, and a local diagnostics report (no Wi-Fi passwords).
+
+### Build and regression checks
+
+```powershell
+.\build.ps1
+# Non-elevated, using the built DLL to bypass the executable's elevation manifest:
+dotnet .\bin\Release\net8.0-windows\HotspotLimiter.dll --self-test
+# Elevated; verifies the actual subnet filter and signed driver in sniff/receive-only mode:
+.\publish-reliable\HotspotLimiter.exe --verify-driver
+```
+
+Tests write `self-test-results.txt` and `driver-check-results.txt` beside the executable. A successful sniff-mode check does not establish end-to-end device connectivity or measured cap accuracy.
+
+### Troubleshooting devices that cannot join
+
+1. Turn the limiter off, then use **Repair hotspot**. Reconnect a phone and verify internet access before enabling a bandwidth cap or quota.
+2. If a phone still rejects the network, forget the saved network on that phone and reconnect with the password shown in Windows Settings → Network & internet → Mobile hotspot.
+3. Use **Diagnostics** to check the Windows state, client limit, actual adapter, and driver. A client with no IPv4 address indicates an address-assignment problem, not a bandwidth setting.
+4. If association fails with the limiter off, investigate the Wi-Fi driver, USB stability/power management, and Windows sharing configuration. Do not disable the firewall or perform a blanket network reset.
+
+On the inspected machine, the Ralink RT5370 (`USB VID_148F / PID_5370`) adapter uses Microsoft driver 5.1.22.0 dated April 2015. Windows logged driver disconnects while associating to its upstream Wi-Fi profile, while Ethernet supplied internet. This is evidence of a driver/radio issue, not proof of the cause of phone-side rejection. If problems persist, use a trusted compatible driver or a modern Windows 11-compatible Wi-Fi adapter. Avoid random driver download sites.
 
 ---
 

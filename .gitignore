@@ -21,3 +21,8 @@
 .DS_Store
 Thumbs.db
 desktop.ini
+ 
+## Build outputs
+publish-fixed-*/
+publish-reliable/
+

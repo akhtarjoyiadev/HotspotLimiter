@@ -20,7 +20,14 @@ internal static class Program
     [STAThread]
     static void Main(string[] args)
     {
+        if (args.Contains("--self-test")) { Environment.ExitCode = SelfTests.Run(); return; }
         Log.Init();
+        if (args.Contains("--verify-driver"))
+        {
+            ExtractResource("HotspotLimiter.WinDivert.dll", "WinDivert.dll");
+            ExtractResource("HotspotLimiter.WinDivert64.sys", "WinDivert64.sys");
+            Environment.ExitCode = SelfTests.VerifyDriver(); return;
+        }
         Log.Write("HotspotLimiter starting. Args: " + string.Join(" ", args));
 
         Application.SetUnhandledExceptionMode(UnhandledExceptionMode.CatchException);
@@ -38,6 +45,8 @@ internal static class Program
 
             ExtractResource("HotspotLimiter.WinDivert.dll", "WinDivert.dll");
             ExtractResource("HotspotLimiter.WinDivert64.sys", "WinDivert64.sys");
+
+
 
             ApplicationConfiguration.Initialize();
             bool startMinimized = args.Any(a => a.Equals("--tray", StringComparison.OrdinalIgnoreCase) || a.Equals("--minimized", StringComparison.OrdinalIgnoreCase));
@@ -73,16 +82,19 @@ internal static class Program
             Log.Write("Error extracting " + fileName + ": " + ex);
         }
     }
+
 }
 
 public sealed class MainForm : Form
 {
     readonly ComboBox adapter = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 310 };
     readonly NumericUpDown limit = new() { Minimum = 0.5m, Maximum = 100000, Value = 4.0m, DecimalPlaces = 1, Increment = 0.5m, Width = 80 };
-    readonly NumericUpDown dailyLimit = new() { Minimum = 0.0m, Maximum = 1000.0m, Value = 1.0m, DecimalPlaces = 2, Increment = 0.25m, Width = 80 };
+    readonly NumericUpDown dailyLimit = new() { Minimum = 0.0m, Maximum = 1000.0m, Value = 0.0m, DecimalPlaces = 2, Increment = 0.25m, Width = 80 };
     readonly Button start = new() { Text = "▶ Start limiter", Width = 110, Height = 28 };
     readonly Button stop = new() { Text = "⏹ Stop", Width = 80, Height = 28, Enabled = false };
     readonly Button toggleHotspot = new() { Text = "📶 Toggle Hotspot", Width = 130, Height = 28 };
+    readonly Button repairHotspot = new() { Text = "Repair hotspot", AutoSize = true };
+    readonly Button diagnostics = new() { Text = "Diagnostics", AutoSize = true };
     readonly Button resetStats = new() { Text = "↺ Reset Stats", Width = 95, Height = 28 };
 
     readonly Label status = new() { AutoSize = true, Text = "Starting...", Font = new Font("Segoe UI", 9f, FontStyle.Bold) };
@@ -113,28 +125,34 @@ public sealed class MainForm : Form
     System.Windows.Forms.Timer? autoDetectTimer;
     bool isExiting = false;
     bool limiterManuallyStopped = false;
-    bool hotspotWasOn = false;
     bool autoDetectRunning = false;
+    bool hotspotOperationRunning;
+    bool suppressAutoStart;
+    DateTime nextStartAttemptUtc;
+    int startFailures;
     readonly bool startedMinimized;
 
     public MainForm(bool startMinimized)
     {
+
         this.startedMinimized = startMinimized;
         var savedSettings = SettingsStore.Load();
         limit.Value = ClampDecimal(savedSettings.LimitMbps, limit.Minimum, limit.Maximum);
         dailyLimit.Value = ClampDecimal(savedSettings.DailyLimitGb, dailyLimit.Minimum, dailyLimit.Maximum);
         autoStartLimiter.Checked = savedSettings.AutoStartLimiter;
-        Text = "Hotspot Limiter & Wi-Fi Tracker (4.0 Mbps)";
-        Width = 750; Height = 560;
+        autoStartHotspot.Checked = savedSettings.AutoStartHotspot;
+        minimizeToTray.Checked = savedSettings.MinimizeToTray;
+        Text = $"Hotspot Limiter & Wi-Fi Tracker ({limit.Value:0.0} Mbps)";
+        Width = 1100; Height = 620;
         StartPosition = FormStartPosition.CenterScreen;
-        MinimumSize = new Size(650, 420);
+        MinimumSize = new Size(1000, 500);
 
         InitTrayIcon();
         InitDeviceList();
 
         // Layout
         var mainContainer = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, Padding = new Padding(12) };
-        mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 165));
+        mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 205));
         mainContainer.RowStyles.Add(new RowStyle(SizeType.Percent, 100));
         mainContainer.RowStyles.Add(new RowStyle(SizeType.Absolute, 35));
 
@@ -152,15 +170,17 @@ public sealed class MainForm : Form
         topPanel.Controls.Add(new Label { Text = "Daily Limit / Device (GB):", AutoSize = true, Anchor = AnchorStyles.Left }, 0, 4);
         topPanel.Controls.Add(dailyLimit, 1, 4);
 
-        var buttonFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = false };
+        var buttonFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = true, Dock = DockStyle.Fill };
         buttonFlow.Controls.Add(start);
         buttonFlow.Controls.Add(stop);
         buttonFlow.Controls.Add(toggleHotspot);
         buttonFlow.Controls.Add(resetStats);
+        buttonFlow.Controls.Add(repairHotspot);
+        buttonFlow.Controls.Add(diagnostics);
         topPanel.SetColumnSpan(buttonFlow, 2);
         topPanel.Controls.Add(buttonFlow, 1, 1);
 
-        var checkFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, FlowDirection = FlowDirection.LeftToRight };
+        var checkFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = true, FlowDirection = FlowDirection.LeftToRight };
         checkFlow.Controls.Add(autoStartHotspot);
         checkFlow.Controls.Add(autoStartLimiter);
         checkFlow.Controls.Add(startup);
@@ -194,153 +214,107 @@ public sealed class MainForm : Form
         stop.Click += (_, _) => StopLimiter();
         toggleHotspot.Click += async (_, _) => await ToggleHotspotAsync();
         resetStats.Click += (_, _) => ResetAllStats();
-        startup.CheckedChanged += (_, _) => StartupManager.SetEnabled(startup.Checked);
+        repairHotspot.Click += async (_, _) => await RepairHotspotAsync();
+        diagnostics.Click += async (_, _) =>
+        {
+            diagnostics.Enabled = false;
+            try { var path = await Diagnostics.WriteReportAsync(); Process.Start(new ProcessStartInfo(path) { UseShellExecute = true }); }
+            catch (Exception ex) { MessageBox.Show(this, ex.Message, "Diagnostics"); }
+            finally { diagnostics.Enabled = true; }
+        };
         startup.Checked = StartupManager.IsEnabled();
-        limit.ValueChanged += (_, _) => SaveSettings();
+        startup.CheckedChanged += (_, _) => StartupManager.SetEnabled(startup.Checked);
+        limit.ValueChanged += (_, _) =>
+        {
+            SaveSettings();
+            UpdateLimitCaption();
+        };
         dailyLimit.ValueChanged += (_, _) => SaveSettings();
         autoStartLimiter.CheckedChanged += (_, _) => SaveSettings();
+        autoStartHotspot.CheckedChanged += (_, _) => { suppressAutoStart = false; nextStartAttemptUtc = DateTime.MinValue; SaveSettings(); };
+        minimizeToTray.CheckedChanged += (_, _) => SaveSettings();
 
         statsTimer = new System.Windows.Forms.Timer { Interval = 1000 };
         statsTimer.Tick += (_, _) => UpdateStats();
         statsTimer.Start();
 
-        // Auto-detect and monitor Hotspot state (3s loop)
-        autoDetectTimer = new System.Windows.Forms.Timer { Interval = 3000 };
-        autoDetectTimer.Tick += async (_, _) =>
+        autoDetectTimer = new System.Windows.Forms.Timer { Interval = 8000 };
+        autoDetectTimer.Tick += async (_, _) => await MonitorHotspotAsync();
+        autoDetectTimer.Start(); // Also works when launched hidden in the system tray.
+        Shown += async (_, _) => await MonitorHotspotAsync();
+    }
+
+    async Task MonitorHotspotAsync()
+    {
+        if (autoDetectRunning || hotspotOperationRunning || isExiting) return;
+        autoDetectRunning = true;
+        try
         {
-            if (autoDetectRunning) return;
-            autoDetectRunning = true;
-            try
+            bool on = await HotspotController.IsHotspotOnAsync();
+            if (isExiting || IsDisposed) return;
+            var state = HotspotController.LastState;
+            // Unknown is NOT Off: don't continually restart a working AP when querying Windows fails.
+            if (state.Success && state.State == "Off" && autoStartHotspot.Checked && !suppressAutoStart && DateTime.UtcNow >= nextStartAttemptUtc)
             {
-                bool isHotspotOn = await HotspotController.IsHotspotOnAsync();
-                hotspotStatusLabel.Text = isHotspotOn ? "Hotspot: On (Wi-Fi)" : "Hotspot: Off";
-                hotspotStatusLabel.ForeColor = isHotspotOn ? Color.DarkGreen : Color.DarkOrange;
-
-                if (autoStartHotspot.Checked && !isHotspotOn)
+                on = await HotspotController.StartHotspotAsync();
+                startFailures = on ? 0 : Math.Min(startFailures + 1, 6);
+                nextStartAttemptUtc = DateTime.UtcNow.AddSeconds(on ? 15 : Math.Min(300, 15 * Math.Pow(2, startFailures)));
+                state = HotspotController.LastState;
+            }
+            ShowHotspotState();
+            if (on)
+            {
+                var nic = FindHotspotAdapter();
+                if (nic != null)
                 {
-                    Log.Write("Hotspot is off - attempting to start it.");
-                    await HotspotController.StartHotspotAsync();
-                    LoadAdapters();
-                    isHotspotOn = await HotspotController.IsHotspotOnAsync();
-                }
-
-                if (isHotspotOn)
-                {
-                    if (!hotspotWasOn)
+                    uint index = GetInterfaceIndex(nic);
+                    if (!limiterManuallyStopped && ((limiter == null && autoStartLimiter.Checked) || (limiter != null && activeVirtualIdx != index)))
                     {
-                        // A newly started hotspot is a new opportunity for automatic startup.
-                        limiterManuallyStopped = false;
+                        LoadAdapters(); StartLimiter(nic, FindUplinkAdapter(nic));
                     }
-                    hotspotWasOn = true;
-
-                    var virtualAdapter = FindHotspotAdapter();
-                    if (virtualAdapter is not null)
-                    {
-                        var uplink = FindUplinkAdapter(virtualAdapter);
-                        uint vIdx = GetInterfaceIndex(virtualAdapter);
-                        uint? uIdx = uplink is not null ? GetInterfaceIndex(uplink) : null;
-
-                        bool adapterChanged = limiter is not null &&
-                            (activeVirtualIdx != vIdx || activeUplinkIdx != uIdx);
-                        bool shouldStartAutomatically = limiter is null && autoStartLimiter.Checked;
-                        if (!limiterManuallyStopped && (shouldStartAutomatically || adapterChanged))
-                        {
-                            Log.Write($"Hotspot detected: virtual={virtualAdapter.Name} (ifIdx {vIdx}), uplink={(uplink?.Name ?? "none")} (ifIdx {uIdx?.ToString() ?? "-"}) - (re)binding limiter.");
-                            LoadAdapters();
-                            StartLimiter(virtualAdapter, uplink);
-                        }
-                        else if (limiter is null)
-                        {
-                            status.Text = limiterManuallyStopped
-                                ? "Stopped (manual)"
-                                : "Hotspot ready - click Start limiter";
-                            status.ForeColor = Color.DarkOrange;
-                        }
-                    }
-                    else
-                    {
-                        Log.Write("Hotspot reported On but no hotspot virtual adapter found; waiting.");
-                        status.Text = "Waiting for hotspot adapter...";
-                        status.ForeColor = Color.DarkOrange;
-                    }
-                }
-                else
-                {
-                    hotspotWasOn = false;
-                    limiterManuallyStopped = false;
-                    if (limiter is not null)
-                    {
-                        Log.Write("Hotspot turned off; stopping limiter.");
-                        StopLimiter(false);
-                    }
-                    else
-                    {
-                        status.Text = autoStartHotspot.Checked
-                            ? "Waiting for Wi-Fi Hotspot..."
-                            : "Hotspot is off";
-                        status.ForeColor = Color.DarkOrange;
-                    }
+                    else if (limiter == null) status.Text = "Hotspot ready — limiter off (internet unrestricted)";
                 }
             }
-            catch (Exception ex)
+            else if (state.Success && state.State == "Off")
             {
-                Log.Write("Auto-detect error: " + ex);
+                if (limiter != null) StopLimiter(false);
             }
-            finally
+            if (limiter?.Failure != null)
             {
-                autoDetectRunning = false;
+                string failure = limiter.Failure;
+                StopLimiter();
+                status.Text = "Limiter stopped safely: " + failure;
+                status.ForeColor = Color.Red;
             }
-        };
-        autoDetectTimer.Start();
+        }
+        catch (Exception ex) { Log.Write("Hotspot monitor: " + ex); }
+        finally { autoDetectRunning = false; }
+    }
 
-        // Startup routine
-        Task.Run(async () =>
+    void ShowHotspotState()
+    {
+        var state = HotspotController.LastState;
+        hotspotStatusLabel.Text = state.IsOn ? $"Hotspot: On | Clients {state.ClientCount}/{state.MaxClientCount}" : $"Hotspot: {state.State}";
+        hotspotStatusLabel.ForeColor = state.IsOn ? Color.DarkGreen : Color.DarkOrange;
+        if (!state.Success) { status.Text = state.Error; status.ForeColor = Color.Red; }
+    }
+
+    async Task RepairHotspotAsync()
+    {
+        if (hotspotOperationRunning || autoDetectRunning) return;
+        if (MessageBox.Show(this, "Reconnect the hotspot in 2.4 GHz compatibility mode? Connected devices will briefly disconnect. Your Wi-Fi name and password will be kept. The limiter will stay off so you can test connectivity first.", "Repair hotspot", MessageBoxButtons.YesNo, MessageBoxIcon.Question) != DialogResult.Yes) return;
+        hotspotOperationRunning = true;
+        repairHotspot.Enabled = toggleHotspot.Enabled = false;
+        try
         {
-            try
-            {
-                if (startMinimized)
-                {
-                    await Task.Delay(5000);
-                }
-
-                for (int attempt = 0; attempt < 3 && !await HotspotController.IsHotspotOnAsync(); attempt++)
-                {
-                    if (autoStartHotspot.Checked)
-                    {
-                        Log.Write($"Startup routine: starting hotspot (attempt {attempt + 1}/3).");
-                        await HotspotController.StartHotspotAsync();
-                    }
-                    for (int i = 0; i < 15 && !await HotspotController.IsHotspotOnAsync(); i++)
-                    {
-                        await Task.Delay(1000);
-                    }
-                }
-
-                Invoke(new Action(() =>
-                {
-                    LoadAdapters();
-                    var virtualAdapter = FindHotspotAdapter();
-                    if (virtualAdapter is not null && autoStartLimiter.Checked)
-                    {
-                        StartLimiter(virtualAdapter, FindUplinkAdapter(virtualAdapter));
-                    }
-                    else if (virtualAdapter is not null)
-                    {
-                        status.Text = "Hotspot ready - select limits, then click Start limiter";
-                        status.ForeColor = Color.DarkOrange;
-                    }
-                    else
-                    {
-                        status.Text = "Waiting for Wi-Fi Hotspot...";
-                        status.ForeColor = Color.DarkOrange;
-                    }
-                }));
-            }
-            catch (Exception ex)
-            {
-                Log.Write("Startup routine error: " + ex);
-            }
-        });
+            StopLimiter();
+            status.Text = "Repairing hotspot...";
+            bool ok = await HotspotController.RepairAsync();
+            suppressAutoStart = !ok;
+            ShowHotspotState(); LoadAdapters();
+            if (ok) status.Text = "Hotspot repaired — reconnect your device; limiter is off for testing.";
+        }
+        finally { hotspotOperationRunning = false; repairHotspot.Enabled = toggleHotspot.Enabled = true; }
     }
 
     protected override void SetVisibleCore(bool value)
@@ -355,7 +329,8 @@ public sealed class MainForm : Form
 
     static decimal ClampDecimal(double value, decimal minimum, decimal maximum)
     {
-        decimal result = (decimal)value;
+        if (!double.IsFinite(value)) return minimum;
+        decimal result = (decimal)Math.Clamp(value, (double)minimum, (double)maximum);
         return Math.Min(maximum, Math.Max(minimum, result));
     }
 
@@ -365,7 +340,9 @@ public sealed class MainForm : Form
         {
             LimitMbps = (double)limit.Value,
             DailyLimitGb = (double)dailyLimit.Value,
-            AutoStartLimiter = autoStartLimiter.Checked
+            AutoStartLimiter = autoStartLimiter.Checked,
+            AutoStartHotspot = autoStartHotspot.Checked,
+            MinimizeToTray = minimizeToTray.Checked
         });
     }
 
@@ -403,7 +380,7 @@ public sealed class MainForm : Form
             trayIcon.Icon = SystemIcons.Application;
         }
 
-        trayIcon.Text = "Hotspot Limiter - 4.0 Mbps Cap";
+        trayIcon.Text = $"Hotspot Limiter - {limit.Value:0.0} Mbps Cap";
         trayIcon.Visible = true;
         trayIcon.DoubleClick += (_, _) => RestoreFromTray();
 
@@ -445,46 +422,40 @@ public sealed class MainForm : Form
 
     async Task ToggleHotspotAsync()
     {
-        toggleHotspot.Enabled = false;
-        hotspotStatusLabel.Text = "Hotspot: Changing...";
-        bool isOn = await HotspotController.IsHotspotOnAsync();
-        if (isOn)
+        if (hotspotOperationRunning || autoDetectRunning) return;
+        hotspotOperationRunning = true;
+        toggleHotspot.Enabled = repairHotspot.Enabled = false;
+        try
         {
-            await HotspotController.StopHotspotAsync();
-            hotspotWasOn = false;
-            limiterManuallyStopped = false;
-            StopLimiter(false);
-            hotspotStatusLabel.Text = "Hotspot: Off";
-            hotspotStatusLabel.ForeColor = Color.DarkOrange;
+            bool on = await HotspotController.IsHotspotOnAsync();
+            if (!HotspotController.LastState.Success) { ShowHotspotState(); return; }
+            if (on)
+            {
+                suppressAutoStart = true; // Respect a manual Stop even when auto-start is checked.
+                StopLimiter(false);
+                await HotspotController.StopHotspotAsync();
+            }
+            else
+            {
+                suppressAutoStart = false;
+                if (await HotspotController.StartHotspotAsync())
+                {
+                    limiterManuallyStopped = false;
+                    if (autoStartLimiter.Checked) StartLimiter();
+                }
+            }
+            ShowHotspotState(); LoadAdapters();
         }
-        else
-        {
-            await HotspotController.StartHotspotAsync();
-            hotspotStatusLabel.Text = "Hotspot: On (Wi-Fi)";
-            hotspotStatusLabel.ForeColor = Color.DarkGreen;
-            hotspotWasOn = true;
-            limiterManuallyStopped = false;
-        }
-        LoadAdapters();
-        if (!isOn && autoStartLimiter.Checked)
-        {
-            StartLimiter();
-        }
-        toggleHotspot.Enabled = true;
+        finally { hotspotOperationRunning = false; toggleHotspot.Enabled = repairHotspot.Enabled = true; }
     }
 
     static NetworkInterface? FindHotspotAdapter()
     {
         var all = NetworkInterface.GetAllNetworkInterfaces().Where(n => n.OperationalStatus == OperationalStatus.Up).ToList();
 
-        var hotspotByIp = all.FirstOrDefault(n => n.GetIPProperties().UnicastAddresses.Any(u => u.Address.ToString().StartsWith("192.168.137.")));
-        if (hotspotByIp is not null) return hotspotByIp;
-
-        var wifiDirect = all.FirstOrDefault(n => n.Description.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) ||
-                                                 n.Name.Contains("Local Area Connection*", StringComparison.OrdinalIgnoreCase));
-        if (wifiDirect is not null) return wifiDirect;
-
-        return null;
+        return all.FirstOrDefault(n =>
+            (n.Description.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) || n.Name.Contains("Local Area Connection*", StringComparison.OrdinalIgnoreCase)) &&
+            n.GetIPProperties().UnicastAddresses.Any(u => u.Address.AddressFamily == AddressFamily.InterNetwork && !IPAddress.IsLoopback(u.Address) && !u.Address.ToString().StartsWith("169.254.")));
     }
 
     static NetworkInterface? FindUplinkAdapter(NetworkInterface? hotspot)
@@ -493,13 +464,29 @@ public sealed class MainForm : Form
         var candidates = NetworkInterface.GetAllNetworkInterfaces()
             .Where(n => n.OperationalStatus == OperationalStatus.Up &&
                         n.NetworkInterfaceType != NetworkInterfaceType.Loopback &&
-                        n.Id != hotspotId)
+                        n.Id != hotspotId &&
+                        !n.Description.Contains("Wi-Fi Direct", StringComparison.OrdinalIgnoreCase) &&
+                        !n.Name.Contains("Local Area Connection*", StringComparison.OrdinalIgnoreCase))
             .ToList();
 
+        // 1. Prefer wired Ethernet adapter with a default gateway
+        var ethernetWithGateway = candidates.FirstOrDefault(n =>
+            n.NetworkInterfaceType == NetworkInterfaceType.Ethernet &&
+            n.GetIPProperties().GatewayAddresses.Count > 0);
+        if (ethernetWithGateway is not null) return ethernetWithGateway;
+
+        // 2. Prefer non-Wi-Fi adapters with a gateway (prevent choosing the hotspot physical Wi-Fi adapter as uplink)
+        var nonWifiWithGateway = candidates.FirstOrDefault(n =>
+            n.NetworkInterfaceType != NetworkInterfaceType.Wireless80211 &&
+            n.GetIPProperties().GatewayAddresses.Count > 0);
+        if (nonWifiWithGateway is not null) return nonWifiWithGateway;
+
+        // 3. Any candidate with a gateway
         var withGateway = candidates.FirstOrDefault(n => n.GetIPProperties().GatewayAddresses.Count > 0);
         if (withGateway is not null) return withGateway;
 
-        return candidates.FirstOrDefault();
+        // 4. Fallback to Ethernet or first candidate
+        return candidates.FirstOrDefault(n => n.NetworkInterfaceType == NetworkInterfaceType.Ethernet) ?? candidates.FirstOrDefault();
     }
 
     void LoadAdapters()
@@ -585,14 +572,19 @@ public sealed class MainForm : Form
             uint vIdx = GetInterfaceIndex(virtualAdapter);
             uint? uIdx = uplink is not null ? GetInterfaceIndex(uplink) : null;
 
-            string filter = (uIdx is not null && uIdx.Value != vIdx)
-                ? $"ifIdx == {vIdx} || ifIdx == {uIdx.Value}"
-                : $"ifIdx == {vIdx}";
+            // NETWORK_FORWARD packets can arrive through a different interface
+            // than the one selected by the route lookup (VPNs, Wi-Fi/Ethernet
+            // changes, and ICS transitions are common examples). Capturing all
+            // forwarded packets and applying the hotspot-client classification
+            // in TryReservePacket prevents those packets from bypassing the cap.
+            var address = virtualAdapter.GetIPProperties().UnicastAddresses.First(x => x.Address.AddressFamily == AddressFamily.InterNetwork);
+            var subnet = new HotspotSubnet(address.Address, address.IPv4Mask);
+            string filter = subnet.CaptureFilter;
 
             activeVirtualIdx = vIdx;
             activeUplinkIdx = uIdx;
             long dailyLimitBytes = ToDailyLimitBytes(dailyLimit.Value);
-            limiter = new Limiter(filter, (double)limit.Value, dailyLimitBytes);
+            limiter = new Limiter(filter, (double)limit.Value, dailyLimitBytes, subnet);
             limiter.Start();
 
             string targetName = uplink is not null ? $"{virtualAdapter.Name} + {uplink.Name}" : virtualAdapter.Name;
@@ -610,6 +602,8 @@ public sealed class MainForm : Form
         }
         catch (Exception ex)
         {
+            limiter?.Dispose(); limiter = null;
+            limiterManuallyStopped = true;
             status.Text = "Error: " + ex.Message;
             status.ForeColor = Color.Red;
             Log.Write("StartLimiter error: " + ex);
@@ -638,6 +632,17 @@ public sealed class MainForm : Form
         adapter.Enabled = true;
         limit.Enabled = true;
         dailyLimit.Enabled = true;
+        UpdateLimitCaption();
+    }
+
+    void UpdateLimitCaption()
+    {
+        string cap = $"{limit.Value:0.0} Mbps";
+        Text = $"Hotspot Limiter & Wi-Fi Tracker ({cap})";
+        if (limiter is null)
+        {
+            trayIcon.Text = $"Hotspot Limiter - {cap} Cap";
+        }
     }
 
     void ResetAllStats()
@@ -649,8 +654,25 @@ public sealed class MainForm : Form
 
     void UpdateStats()
     {
-        if (limiter is null) return;
-
+        var connected = HotspotController.LastState.Clients;
+        if (limiter is null)
+        {
+            usage.Text = $"Limiter off — internet unrestricted | Connected devices: {HotspotController.LastState.ClientCount}";
+            deviceList.BeginUpdate();
+            try
+            {
+                deviceList.Items.Clear();
+                foreach (var client in connected)
+                {
+                    var row = new ListViewItem(string.IsNullOrEmpty(client.IpAddress) ? "Obtaining IP…" : client.IpAddress);
+                    row.SubItems.AddRange(new[] { "Connected client", client.MacAddress, "—", "—", "—", FormatBytes(DailyUsageStore.Get(client.IpAddress)), "Not enforced", "—", "Connected" });
+                    deviceList.Items.Add(row);
+                }
+            }
+            finally { deviceList.EndUpdate(); }
+            return;
+        }
+        limiter.RegisterConnectedClients(connected);
         var devices = limiter.GetDevicesSnapshot();
         long totalBytes = limiter.TotalBytes;
         string quotaText = limiter.DailyLimitBytes > 0 ? $" | Daily/device: {FormatBytes(limiter.DailyLimitBytes)}" : "";
@@ -750,6 +772,8 @@ public sealed class MainForm : Form
             return;
         }
 
+        isExiting = true;
+        statsTimer?.Stop(); autoDetectTimer?.Stop();
         limiter?.Dispose();
         DailyUsageStore.Flush();
         trayIcon.Visible = false;
@@ -782,6 +806,7 @@ public sealed class DeviceStats
     public double CurrentSpeedBps;
     public DateTime LastSeen = DateTime.UtcNow;
     public DateTime FirstSeen = DateTime.UtcNow;
+    public DateTime LastIdentityAttemptUtc = DateTime.MinValue;
     public bool QuotaReached;
     public long TodayBytes => DailyUsageStore.Get(QuotaKey.Length > 0 ? QuotaKey : IpAddress);
 }
@@ -789,15 +814,17 @@ public sealed class DeviceStats
 public sealed class Limiter : IDisposable
 {
     const int MaxPacket = 65535;
-    const double BurstSeconds = 0.25;
+    readonly HotspotSubnet subnet;
+    readonly TokenBucket bucket;
+    Task? worker;
+    public string? Failure { get; private set; }
     readonly string filter;
-    readonly double bytesPerSecond;
-    readonly double maxTokens;
+
     readonly long dailyLimitBytes;
     IntPtr handle = IntPtr.Zero;
     CancellationTokenSource cts = new();
     long totalBytes;
-    double tokens;
+
     long lastTicks;
     readonly object gate = new();
 
@@ -807,19 +834,28 @@ public sealed class Limiter : IDisposable
     public long TotalBytes => Interlocked.Read(ref totalBytes);
     public long DailyLimitBytes => dailyLimitBytes;
 
-    public Limiter(string filter, double mbps, long dailyLimitBytes)
+    public Limiter(string filter, double mbps, long dailyLimitBytes, HotspotSubnet subnet)
     {
         this.filter = filter;
-        bytesPerSecond = mbps * 1_000_000.0 / 8.0;
-        maxTokens = Math.Max(bytesPerSecond * BurstSeconds, 8192);
+        this.subnet = subnet;
+        bucket = new TokenBucket(mbps * 1_000_000.0 / 8.0);
         this.dailyLimitBytes = dailyLimitBytes;
-        tokens = maxTokens;
         lastTicks = Stopwatch.GetTimestamp();
 
         speedCalcTimer = new System.Threading.Timer(_ => CalculateLiveSpeeds(), null, 1000, 1000);
     }
 
     public ConcurrentDictionary<string, DeviceStats> GetDevicesSnapshot() => devices;
+
+    public void RegisterConnectedClients(IEnumerable<ConnectedClient> clients)
+    {
+        foreach (var client in clients)
+        {
+            if (!IPAddress.TryParse(client.IpAddress, out var ip) || ip.AddressFamily != AddressFamily.InterNetwork) continue;
+            var device = devices.GetOrAdd(client.IpAddress, address => new DeviceStats { IpAddress = address, QuotaKey = address });
+            if (!string.IsNullOrWhiteSpace(client.MacAddress)) device.MacAddress = client.MacAddress;
+        }
+    }
 
     public void ResetStats()
     {
@@ -829,11 +865,29 @@ public sealed class Limiter : IDisposable
 
     void CalculateLiveSpeeds()
     {
+        var now = DateTime.UtcNow;
         foreach (var d in devices.Values)
         {
             long currentPeriod = Interlocked.Exchange(ref d.PeriodBytes, 0);
             d.CurrentSpeedBps = currentPeriod;
+
+            // ARP/DNS can fail briefly while a phone is joining the hotspot.
+            // Retry unknown identities so a transient miss does not permanently
+            // leave a client as "Client (64)" with no MAC address.
+            bool identityUnknown = d.MacAddress is "Resolving..." or "—" ||
+                                   d.HostName == "Device" ||
+                                   d.HostName.StartsWith("Client (", StringComparison.Ordinal);
+            if (identityUnknown && (now - d.LastIdentityAttemptUtc).TotalSeconds >= 10)
+            {
+                QueueDeviceInfoRefresh(d);
+            }
         }
+    }
+
+    static void QueueDeviceInfoRefresh(DeviceStats device)
+    {
+        device.LastIdentityAttemptUtc = DateTime.UtcNow;
+        Task.Run(() => ResolveDeviceInfo(device));
     }
 
     public void Start()
@@ -846,22 +900,25 @@ public sealed class Limiter : IDisposable
             Log.Write($"WinDivertOpen failed. Filter: {filter}, Win32 error: {err}");
             throw new InvalidOperationException($"WinDivertOpen failed. Win32 error: {err}");
         }
-        WinDivert.SetParam(handle, WinDivertParam.QueueLength, 16384);
-        WinDivert.SetParam(handle, WinDivertParam.QueueSize, 32 * 1024 * 1024);
-        Task.Run(Run, cts.Token);
+        WinDivert.SetParam(handle, WinDivertParam.QueueLength, 2048);
+        WinDivert.SetParam(handle, WinDivertParam.QueueTime, 1000);
+        WinDivert.SetParam(handle, WinDivertParam.QueueSize, 4 * 1024 * 1024);
+        worker = Task.Run(Run);
     }
 
     async Task Run()
     {
         var packet = new byte[MaxPacket];
         var addr = new WinDivertAddress();
+        try
+        {
         while (!cts.IsCancellationRequested)
         {
             uint len = 0;
             if (!WinDivert.Recv(handle, packet, (uint)packet.Length, ref len, ref addr))
             {
                 if (cts.IsCancellationRequested) break;
-                continue;
+                throw new IOException($"Packet receive failed ({Marshal.GetLastWin32Error()}).");
             }
             if (len == 0) continue;
 
@@ -873,13 +930,18 @@ public sealed class Limiter : IDisposable
                 continue;
             }
 
-            await Consume((int)len).ConfigureAwait(false);
+            if (device is not null)
+            {
+                await Consume((int)len).ConfigureAwait(false);
+            }
+
             uint sent = 0;
             if (!WinDivert.Send(handle, packet, len, ref sent, ref addr))
             {
-                continue;
+                throw new IOException($"Packet reinjection failed ({Marshal.GetLastWin32Error()}).");
             }
-            Interlocked.Add(ref totalBytes, len);
+            if (sent != len) throw new IOException("Incomplete packet reinjection.");
+            if (device != null) Interlocked.Add(ref totalBytes, len);
             if (device is not null)
             {
                 device.LastSeen = DateTime.UtcNow;
@@ -894,43 +956,39 @@ public sealed class Limiter : IDisposable
                 }
             }
         }
+        }
+        catch (OperationCanceledException) when (cts.IsCancellationRequested) { }
+        catch (Exception ex) { Failure = ex.Message; Log.Write("Limiter failed open: " + ex); }
+        finally
+        {
+            // Drain the receive queue unshaped before closing, avoiding a black-hole after worker failure.
+            if (handle != IntPtr.Zero && handle != new IntPtr(-1))
+            {
+                WinDivert.Shutdown(handle, 1);
+                uint length = 0;
+                while (WinDivert.Recv(handle, packet, (uint)packet.Length, ref length, ref addr))
+                {
+                    uint sent = 0; WinDivert.Send(handle, packet, length, ref sent, ref addr);
+                }
+                WinDivert.Close(handle); handle = IntPtr.Zero;
+            }
+        }
     }
 
     bool TryReservePacket(byte[] packet, int len, out DeviceStats? device, out bool isDownload)
     {
         device = null;
         isDownload = false;
-        if (len < 20) return true;
-        int version = packet[0] >> 4;
-
-        string? clientIp = null;
-
-        if (version == 4)
-        {
-            string srcIp = $"{packet[12]}.{packet[13]}.{packet[14]}.{packet[15]}";
-            string dstIp = $"{packet[16]}.{packet[17]}.{packet[18]}.{packet[19]}";
-
-            if (IsClientIp(srcIp))
-            {
-                clientIp = srcIp;
-                isDownload = false;
-            }
-            else if (IsClientIp(dstIp))
-            {
-                clientIp = dstIp;
-                isDownload = true;
-            }
-        }
-
-        if (clientIp is null) return true;
+        if (!subnet.TryClassify(packet, len, out string? clientIp, out isDownload) || clientIp == null) return true;
 
         device = devices.GetOrAdd(clientIp, ip =>
         {
             var newDevice = new DeviceStats { IpAddress = ip, QuotaKey = ip };
-            Task.Run(() => ResolveDeviceInfo(newDevice));
+            QueueDeviceInfoRefresh(newDevice);
             return newDevice;
         });
 
+        device.QuotaReached = false;
         if (dailyLimitBytes > 0 && !DailyUsageStore.TryReserve(device.QuotaKey, len, dailyLimitBytes))
         {
             device.QuotaReached = true;
@@ -946,7 +1004,7 @@ public sealed class Limiter : IDisposable
         return true;
     }
 
-    bool IsClientIp(string ip) => ip.StartsWith("192.168.137.") && !ip.EndsWith(".1") && !ip.EndsWith(".255");
+
 
     static void ResolveDeviceInfo(DeviceStats device)
     {
@@ -1004,162 +1062,26 @@ public sealed class Limiter : IDisposable
             {
                 var now = Stopwatch.GetTimestamp();
                 var elapsed = (now - lastTicks) / (double)Stopwatch.Frequency;
-                if (elapsed > 0)
-                {
-                    tokens = Math.Min(maxTokens, tokens + elapsed * bytesPerSecond);
-                    lastTicks = now;
-                }
-                if (tokens >= bytes)
-                {
-                    tokens -= bytes;
-                    return;
-                }
-                waitSeconds = (bytes - tokens) / bytesPerSecond;
+                lastTicks = now;
+                waitSeconds = bucket.Reserve(bytes, elapsed);
+                if (waitSeconds == 0) return;
             }
             await Task.Delay(TimeSpan.FromSeconds(Math.Min(Math.Max(waitSeconds, 0.001), 0.25)), cts.Token).ConfigureAwait(false);
         }
     }
 
+    int disposed;
     public void Dispose()
     {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
         cts.Cancel();
         speedCalcTimer?.Dispose();
-        if (handle != IntPtr.Zero && handle != new IntPtr(-1))
-        {
-            WinDivert.Shutdown(handle, 3);
-            WinDivert.Close(handle);
-            handle = IntPtr.Zero;
-        }
+        if (handle != IntPtr.Zero && handle != new IntPtr(-1)) WinDivert.Shutdown(handle, 1);
+        // Worker owns the native handle; never close/reuse it while Recv/Send is in flight.
+        if (worker != null) worker.GetAwaiter().GetResult();
+        else if (handle != IntPtr.Zero && handle != new IntPtr(-1)) { WinDivert.Close(handle); handle = IntPtr.Zero; }
         cts.Dispose();
         DailyUsageStore.Flush();
-    }
-}
-
-public static class HotspotController
-{
-    public static async Task<bool> IsHotspotOnAsync()
-    {
-        return await Task.Run(() =>
-        {
-            try
-            {
-                foreach (var n in NetworkInterface.GetAllNetworkInterfaces())
-                {
-                    if (n.OperationalStatus != OperationalStatus.Up) continue;
-                    var props = n.GetIPProperties();
-                    if (props.UnicastAddresses.Any(x => x.Address.ToString().StartsWith("192.168.137.")))
-                        return true;
-                }
-            }
-            catch { }
-            return false;
-        });
-    }
-
-    public static async Task<bool> StartHotspotAsync()
-    {
-        return await Task.Run(() =>
-        {
-            try
-            {
-                string script = @"
-                    $ErrorActionPreference = 'Continue'
-                    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-                    $profile = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile()
-                    if ($null -eq $profile) {
-                        Write-Output 'RESULT: NO_INTERNET_PROFILE'
-                        exit 1
-                    }
-                    $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($profile)
-                    if ($mgr.TetheringOperationalState -eq [Windows.Networking.NetworkOperators.TetheringOperationalState]::On) {
-                        Write-Output 'RESULT: ALREADY_ON'
-                        exit 0
-                    }
-                    $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-                        $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-                    })[0]
-                    $op = $mgr.StartTetheringAsync()
-                    $t = $asTask.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]).Invoke($null, @($op))
-                    if ($t.Wait(20000)) {
-                        Write-Output ('RESULT: ' + $t.Result.Status)
-                    } else {
-                        Write-Output 'RESULT: TIMEOUT'
-                        exit 1
-                    }
-                ";
-
-                byte[] bytes = Encoding.Unicode.GetBytes(script);
-                string encoded = Convert.ToBase64String(bytes);
-
-                var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true
-                };
-                using var p = Process.Start(psi);
-                if (p is null)
-                {
-                    Log.Write("Hotspot start: failed to launch PowerShell.");
-                    return false;
-                }
-                string output = p.StandardOutput.ReadToEnd();
-                string err = p.StandardError.ReadToEnd();
-                p.WaitForExit(25000);
-                Log.Write($"Hotspot start output: {output.Trim()}{(string.IsNullOrWhiteSpace(err) ? "" : " | stderr: " + err.Trim())}");
-                return output.Contains("ALREADY_ON") || output.Contains("Success") || output.Contains("RESULT: Success");
-            }
-            catch (Exception ex)
-            {
-                Log.Write("Hotspot start exception: " + ex.Message);
-                return false;
-            }
-        });
-    }
-
-    public static async Task<bool> StopHotspotAsync()
-    {
-        return await Task.Run(() =>
-        {
-            try
-            {
-                string script = @"
-                    Add-Type -AssemblyName System.Runtime.WindowsRuntime
-                    $profile = [Windows.Networking.Connectivity.NetworkInformation, Windows.Networking.Connectivity, ContentType = WindowsRuntime]::GetInternetConnectionProfile()
-                    if ($null -ne $profile) {
-                        $mgr = [Windows.Networking.NetworkOperators.NetworkOperatorTetheringManager, Windows.Networking.NetworkOperators, ContentType = WindowsRuntime]::CreateFromConnectionProfile($profile)
-                        if ($mgr.TetheringOperationalState -eq [Windows.Networking.NetworkOperators.TetheringOperationalState]::On) {
-                            $asTask = ([System.WindowsRuntimeSystemExtensions].GetMethods() | Where-Object {
-                                $_.Name -eq 'AsTask' -and $_.GetParameters().Count -eq 1 -and $_.GetParameters()[0].ParameterType.Name -eq 'IAsyncOperation`1'
-                            })[0]
-                            $op = $mgr.StopTetheringAsync()
-                            $t = $asTask.MakeGenericMethod([Windows.Networking.NetworkOperators.NetworkOperatorTetheringOperationResult]).Invoke($null, @($op))
-                            $t.Wait(10000)
-                        }
-                    }
-                ";
-
-                byte[] bytes = Encoding.Unicode.GetBytes(script);
-                string encoded = Convert.ToBase64String(bytes);
-
-                var psi = new ProcessStartInfo("powershell.exe", $"-NoProfile -NonInteractive -ExecutionPolicy Bypass -EncodedCommand {encoded}")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false,
-                    WindowStyle = ProcessWindowStyle.Hidden
-                };
-                using var p = Process.Start(psi);
-                p?.WaitForExit(12000);
-                Log.Write("Hotspot stop requested.");
-                return true;
-            }
-            catch
-            {
-                return false;
-            }
-        });
     }
 }
 
@@ -1191,52 +1113,48 @@ public static class StartupManager
 
     public static void SetEnabled(bool enabled)
     {
-        string exePath = Application.ExecutablePath;
-        string cmd = $"\"{exePath}\" --tray";
-
+        string? xmlPath = null;
         try
         {
-            using var k = Microsoft.Win32.Registry.CurrentUser.CreateSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run");
+            var info = new ProcessStartInfo("schtasks.exe") { CreateNoWindow = true, UseShellExecute = false, RedirectStandardOutput = true, RedirectStandardError = true };
             if (enabled)
             {
-                k.SetValue("HotspotLimiter", cmd);
+                string exe = System.Security.SecurityElement.Escape(Application.ExecutablePath)!;
+                string user = System.Security.SecurityElement.Escape(System.Security.Principal.WindowsIdentity.GetCurrent().Name)!;
+                string xml = $"""
+                    <?xml version="1.0" encoding="UTF-16"?>
+                    <Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+                      <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{user}</UserId><Delay>PT10S</Delay></LogonTrigger></Triggers>
+                      <Principals><Principal id="Author"><UserId>{user}</UserId><LogonType>InteractiveToken</LogonType><RunLevel>HighestAvailable</RunLevel></Principal></Principals>
+                      <Settings><MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy><DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries><StopIfGoingOnBatteries>false</StopIfGoingOnBatteries><ExecutionTimeLimit>PT0S</ExecutionTimeLimit><Enabled>true</Enabled></Settings>
+                      <Actions Context="Author"><Exec><Command>{exe}</Command><Arguments>--tray</Arguments></Exec></Actions>
+                    </Task>
+                    """;
+                xmlPath = Path.Combine(Path.GetTempPath(), "HotspotLimiter-task-" + Guid.NewGuid().ToString("N") + ".xml");
+                File.WriteAllText(xmlPath, xml, Encoding.Unicode);
+                foreach (var arg in new[] { "/create", "/tn", TaskName, "/xml", xmlPath, "/f" }) info.ArgumentList.Add(arg);
             }
-            else
-            {
-                k.DeleteValue("HotspotLimiter", false);
-            }
+            else foreach (var arg in new[] { "/delete", "/tn", TaskName, "/f" }) info.ArgumentList.Add(arg);
+            using var process = Process.Start(info) ?? throw new IOException("Unable to start Task Scheduler.");
+            var output = process.StandardOutput.ReadToEndAsync();
+            var error = process.StandardError.ReadToEndAsync();
+            if (!process.WaitForExit(10000)) { process.Kill(); throw new TimeoutException("Task Scheduler timed out."); }
+            if (process.ExitCode != 0 && enabled) throw new IOException(output.GetAwaiter().GetResult() + error.GetAwaiter().GetResult());
+            // A Run entry cannot elevate and also launched a duplicate instance of the scheduled task.
+            using var key = Microsoft.Win32.Registry.CurrentUser.OpenSubKey(@"Software\Microsoft\Windows\CurrentVersion\Run", true);
+            key?.DeleteValue("HotspotLimiter", false);
         }
-        catch { }
-
-        try
-        {
-            if (enabled)
-            {
-                var psi = new ProcessStartInfo("schtasks.exe", $"/create /tn \"{TaskName}\" /tr \"{cmd}\" /sc onlogon /delay 0000:10 /rl highest /f")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                };
-                Process.Start(psi)?.WaitForExit(3000);
-            }
-            else
-            {
-                var psi = new ProcessStartInfo("schtasks.exe", $"/delete /tn \"{TaskName}\" /f")
-                {
-                    CreateNoWindow = true,
-                    UseShellExecute = false
-                };
-                Process.Start(psi)?.WaitForExit(3000);
-            }
-        }
-        catch { }
+        catch (Exception ex) { Log.Write("Startup registration: " + ex); MessageBox.Show(ex.Message, "Windows startup registration failed"); }
+        finally { if (xmlPath != null) { try { File.Delete(xmlPath); } catch { } } }
     }
 }
 
 public sealed class AppSettings
 {
     public double LimitMbps { get; set; } = 4.0;
-    public double DailyLimitGb { get; set; } = 1.0;
+    public double DailyLimitGb { get; set; } = 0.0;
+    public bool AutoStartHotspot { get; set; } = true;
+    public bool MinimizeToTray { get; set; } = true;
     public bool AutoStartLimiter { get; set; } = false;
 }
 
@@ -1290,7 +1208,7 @@ static class DailyUsageStore
         "HotspotLimiter", "daily-usage.json");
     static string date = DateTime.Now.ToString("yyyy-MM-dd");
     static Dictionary<string, long> deviceBytes = new(StringComparer.OrdinalIgnoreCase);
-    static DateTime lastSaveUtc = DateTime.MinValue;
+    static readonly System.Threading.Timer SaveTimer = new(_ => FlushIfDirty(), null, 15000, 15000);
     static long unsavedBytes;
 
     static DailyUsageStore()
@@ -1322,7 +1240,6 @@ static class DailyUsageStore
 
             deviceBytes[key] = checked(current + bytes);
             unsavedBytes = checked(unsavedBytes + bytes);
-            MaybeSaveLocked();
             return true;
         }
     }
@@ -1336,7 +1253,6 @@ static class DailyUsageStore
             long current = deviceBytes.TryGetValue(key, out long value) ? value : 0;
             deviceBytes[key] = checked(current + bytes);
             unsavedBytes = checked(unsavedBytes + bytes);
-            MaybeSaveLocked();
         }
     }
 
@@ -1379,11 +1295,12 @@ static class DailyUsageStore
         SaveLocked();
     }
 
-    static void MaybeSaveLocked()
+    static void FlushIfDirty()
     {
-        if (unsavedBytes >= 1_000_000 || DateTime.UtcNow - lastSaveUtc >= TimeSpan.FromSeconds(15))
+        lock (Gate)
         {
-            SaveLocked();
+            EnsureCurrentDayLocked();
+            if (unsavedBytes > 0) SaveLocked();
         }
     }
 
@@ -1396,7 +1313,6 @@ static class DailyUsageStore
             var stored = new UsageFile { Date = date, DeviceBytes = new Dictionary<string, long>(deviceBytes) };
             File.WriteAllText(tempPath, JsonSerializer.Serialize(stored, new JsonSerializerOptions { WriteIndented = true }));
             File.Move(tempPath, FilePath, true);
-            lastSaveUtc = DateTime.UtcNow;
             unsavedBytes = 0;
         }
         catch
@@ -1418,6 +1334,7 @@ static class Log
             string dir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "HotspotLimiter");
             Directory.CreateDirectory(dir);
             filePath = Path.Combine(dir, "HotspotLimiter.log");
+            if (File.Exists(filePath) && new FileInfo(filePath).Length > 2_000_000) File.Move(filePath, filePath + ".previous", true);
             Write("========== Log session start ==========");
         }
         catch { }
@@ -1430,6 +1347,7 @@ static class Log
         {
             lock (Lock)
             {
+                if (File.Exists(filePath) && new FileInfo(filePath).Length > 2_000_000) File.Move(filePath, filePath + ".previous", true);
                 File.AppendAllText(filePath, $"[{DateTime.Now:yyyy-MM-dd HH:mm:ss}] {message}{Environment.NewLine}");
             }
         }
